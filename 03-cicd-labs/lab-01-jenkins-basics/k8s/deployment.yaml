@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins-demo-app
+  namespace: default
+  labels:
+    app: jenkins-demo
+    version: v1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: jenkins-demo
+  template:
+    metadata:
+      labels:
+        app: jenkins-demo
+        version: v1
+    spec:
+      containers:
+        - name: app
+          image: jenkins-demo-app:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 5000
+              name: http
+          env:
+            - name: ENVIRONMENT
+              value: "production"
+            - name: PORT
+              value: "5000"
+            - name: BUILD_NUMBER
+              value: "${BUILD_NUMBER}"
+            - name: GIT_COMMIT
+              value: "${GIT_COMMIT}"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 5

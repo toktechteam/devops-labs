@@ -1,0 +1,86 @@
+# Production-ready secure Dockerfile
+FROM python:3.11-slim
+
+# Security: Use specific version tags
+# FROM python:3.11.5-slim-bookworm
+
+# Metadata using OCI standard labels
+LABEL org.opencontainers.image.title="Secure Flask Application" \
+      org.opencontainers.image.description="Production-ready Flask app with security best practices" \
+      org.opencontainers.image.vendor="DevOps Lab" \
+      org.opencontainers.image.version="1.0.0"
+
+# Security: Don't run as root
+# Create user first to ensure consistent UID/GID
+RUN groupadd -r -g 1000 appgroup && \
+    useradd -r -u 1000 -g appgroup \
+    -d /home/appuser -s /sbin/nologin \
+    -c "Application user" appuser && \
+    mkdir -p /home/appuser && \
+    chown -R appuser:appgroup /home/appuser
+
+# Security: Update base image packages
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Security: Set secure environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONHASHSEED=random \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=100
+
+# Set working directory with proper permissions
+WORKDIR /app
+RUN chown appuser:appgroup /app
+
+# Install Python dependencies as root (for system packages)
+COPY --chown=appuser:appgroup requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    # Security: Remove pip after installation
+    pip uninstall -y pip wheel setuptools && \
+    # Remove unnecessary files
+    find /usr/local -type f -name '*.pyc' -delete && \
+    find /usr/local -type d -name '__pycache__' -delete
+
+# Copy application with correct ownership
+COPY --chown=appuser:appgroup app.py .
+
+# Security: Set read-only for application files
+RUN chmod 444 app.py requirements.txt
+
+# Security: Create directory for runtime data with write permissions
+RUN mkdir -p /app/data && \
+    chown appuser:appgroup /app/data && \
+    chmod 750 /app/data
+
+# Switch to non-root user
+USER appuser
+
+# Security: Don't use shell form to avoid shell injection
+EXPOSE 5000
+
+# Health check with timeout
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["curl", "-f", "http://localhost:5000/health"]
+
+# Security: Use exec form to run as PID 1
+ENTRYPOINT ["python"]
+CMD ["app.py"]
+
+# Security considerations implemented:
+# 1. Non-root user (appuser)
+# 2. Minimal base image (slim)
+# 3. No unnecessary packages
+# 4. Read-only application files
+# 5. Secure environment variables
+# 6. Health check for orchestration
+# 7. Exec form for proper signal handling
+# 8. Removed package managers after use

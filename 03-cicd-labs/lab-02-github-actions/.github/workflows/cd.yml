@@ -1,0 +1,240 @@
+name: CD Pipeline
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types:
+      - completed
+    branches: [main]
+  
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      version:
+        description: 'Version to deploy (docker tag)'
+        required: false
+        default: 'latest'
+
+env:
+  DOCKER_REGISTRY: docker.io
+  APP_NAME: github-actions-demo
+
+jobs:
+  # Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging' ||
+      github.event.workflow_run.conclusion == 'success'
+    
+    environment:
+      name: staging
+      url: https://staging.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Deploy to ECS Staging
+        run: |
+          # Update ECS service with new image
+          aws ecs update-service \
+            --cluster staging-cluster \
+            --service ${{ env.APP_NAME }}-staging \
+            --force-new-deployment
+      
+      - name: Deploy to Kubernetes Staging
+        uses: azure/k8s-deploy@v4
+        with:
+          namespace: staging
+          manifests: |
+            k8s/deployment.yaml
+            k8s/service.yaml
+          images: |
+            ${{ env.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.APP_NAME }}:${{ github.event.inputs.version || 'latest' }}
+      
+      - name: Run smoke tests
+        run: |
+          sleep 30
+          ./scripts/smoke-test.sh staging
+      
+      - name: Notify deployment
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "Deployment to Staging Successful! :rocket:",
+              attachments: [{
+                color: 'good',
+                text: `Version ${process.env.GITHUB_SHA} deployed to staging environment`
+              }]
+            }
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Deploy to Production
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    
+    environment:
+      name: production
+      url: https://production.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Manual Approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: DevOpsTeam,john-doe,jane-smith
+          minimum-approvals: 2
+          issue-title: "Production Deployment Approval Required"
+          issue-body: |
+            Please approve the production deployment for:
+            - **Version**: ${{ github.sha }}
+            - **Environment**: Production
+            - **Triggered by**: ${{ github.actor }}
+            
+            Review the staging deployment before approving.
+      
+      - name: Blue-Green Deployment Setup
+        id: blue-green
+        run: |
+          # Determine current active environment
+          CURRENT=$(aws elbv2 describe-target-groups \
+            --names prod-blue prod-green \
+            --query 'TargetGroups[?length(TargetHealthDescriptions[?TargetHealth.State==`healthy`]) > `0`].TargetGroupName' \
+            --output text)
+          
+          if [ "$CURRENT" == "prod-blue" ]; then
+            echo "target=green" >> $GITHUB_OUTPUT
+            echo "current=blue" >> $GITHUB_OUTPUT
+          else
+            echo "target=blue" >> $GITHUB_OUTPUT
+            echo "current=green" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Deploy to Inactive Environment
+        run: |
+          # Deploy to inactive environment
+          kubectl set image deployment/${{ env.APP_NAME }}-${{ steps.blue-green.outputs.target }} \
+            app=${{ env.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.APP_NAME }}:${{ github.sha }} \
+            --namespace=production
+          
+          # Wait for rollout
+          kubectl rollout status deployment/${{ env.APP_NAME }}-${{ steps.blue-green.outputs.target }} \
+            --namespace=production
+      
+      - name: Run Production Tests
+        run: |
+          # Run tests against inactive environment
+          ./scripts/production-test.sh ${{ steps.blue-green.outputs.target }}
+      
+      - name: Switch Traffic
+        run: |
+          # Switch load balancer to new environment
+          aws elbv2 modify-listener \
+            --listener-arn ${{ secrets.PROD_LISTENER_ARN }} \
+            --default-actions Type=forward,TargetGroupArn=${{ secrets[format('PROD_{0}_TG_ARN', steps.blue-green.outputs.target)] }}
+          
+          echo "Traffic switched to ${{ steps.blue-green.outputs.target }} environment"
+      
+      - name: Monitor Deployment
+        run: |
+          # Monitor for 5 minutes
+          for i in {1..30}; do
+            sleep 10
+            
+            # Check health
+            HEALTH=$(curl -s https://production.example.com/health | jq -r '.status')
+            
+            if [ "$HEALTH" != "healthy" ]; then
+              echo "Health check failed! Rolling back..."
+              
+              # Rollback
+              aws elbv2 modify-listener \
+                --listener-arn ${{ secrets.PROD_LISTENER_ARN }} \
+                --default-actions Type=forward,TargetGroupArn=${{ secrets[format('PROD_{0}_TG_ARN', steps.blue-green.outputs.current)] }}
+              
+              exit 1
+            fi
+            
+            echo "Health check $i/30 passed"
+          done
+      
+      - name: Create Deployment Record
+        uses: actions/github-script@v6
+        with:
+          script: |
+            await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'production',
+              auto_merge: false,
+              required_contexts: [],
+              description: 'Production deployment'
+            });
+
+  # Rollback Job
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: [deploy-staging, deploy-production]
+    
+    steps:
+      - name: Determine Environment
+        id: env
+        run: |
+          if [ "${{ needs.deploy-production.result }}" == "failure" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Rollback Deployment
+        run: |
+          kubectl rollout undo deployment/${{ env.APP_NAME }} \
+            --namespace=${{ steps.env.outputs.environment }}
+          
+          kubectl rollout status deployment/${{ env.APP_NAME }} \
+            --namespace=${{ steps.env.outputs.environment }}
+      
+      - name: Notify Rollback
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "Deployment Rolled Back! :warning:",
+              attachments: [{
+                color: 'danger',
+                text: `Deployment to ${{ steps.env.outputs.environment }} failed and was rolled back`
+              }]
+            }
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}

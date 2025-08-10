@@ -1,0 +1,515 @@
+# GitLab CI/CD Pipeline Configuration
+# This is a complete GitLab CI pipeline with all features
+
+# Pipeline configuration
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        ENVIRONMENT: "production"
+    - if: $CI_COMMIT_BRANCH == "develop"
+      variables:
+        ENVIRONMENT: "staging"
+    - if: $CI_MERGE_REQUEST_IID
+      variables:
+        ENVIRONMENT: "review"
+    - when: always
+      variables:
+        ENVIRONMENT: "development"
+
+# Global variables
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  FF_USE_FASTZIP: "true"
+  ARTIFACT_COMPRESSION_LEVEL: "fast"
+  CACHE_COMPRESSION_LEVEL: "fast"
+  DOCKER_IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  DOCKER_IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
+
+# Stages definition
+stages:
+  - build
+  - test
+  - security
+  - package
+  - deploy
+  - monitor
+  - cleanup
+
+# Global cache configuration
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - node_modules/
+    - .npm/
+    - vendor/
+
+# Include other CI files
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/DAST.gitlab-ci.yml
+
+# ============ BUILD STAGE ============
+build:app:
+  stage: build
+  image: node:18-alpine
+  before_script:
+    - echo "Starting build for commit $CI_COMMIT_SHORT_SHA"
+    - npm --version
+    - node --version
+  script:
+    - cd src
+    - npm ci --cache .npm --prefer-offline
+    - npm run build || echo "No build step defined"
+    - echo "Build completed successfully"
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+    paths:
+      - src/dist/
+      - src/node_modules/
+    expire_in: 1 hour
+    reports:
+      dotenv: build.env
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}-npm
+    paths:
+      - src/.npm/
+      - src/node_modules/
+  only:
+    - branches
+    - merge_requests
+    - tags
+
+build:docker:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - docker info
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" "$CI_REGISTRY" --password-stdin
+  script:
+    - docker build -t $DOCKER_IMAGE_TAG -t $DOCKER_IMAGE_LATEST .
+    - docker push $DOCKER_IMAGE_TAG
+    - docker push $DOCKER_IMAGE_LATEST
+    - echo "IMAGE_TAG=$CI_COMMIT_SHORT_SHA" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_MERGE_REQUEST_IID'
+
+# ============ TEST STAGE ============
+test:unit:
+  stage: test
+  image: node:18-alpine
+  needs: ["build:app"]
+  coverage: '/Lines\s*:\s*(\d+\.\d+)%/'
+  before_script:
+    - cd src
+  script:
+    - npm run test:unit
+    - npm run test:coverage
+  artifacts:
+    when: always
+    paths:
+      - src/coverage/
+    reports:
+      junit: src/test-results.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: src/coverage/cobertura-coverage.xml
+  only:
+    - branches
+    - merge_requests
+
+test:integration:
+  stage: test
+  image: node:18-alpine
+  needs: ["build:app"]
+  services:
+    - postgres:14-alpine
+    - redis:7-alpine
+  variables:
+    POSTGRES_DB: testdb
+    POSTGRES_USER: testuser
+    POSTGRES_PASSWORD: testpass
+    DATABASE_URL: "postgresql://testuser:testpass@postgres:5432/testdb"
+    REDIS_URL: "redis://redis:6379"
+  script:
+    - cd src
+    - npm run test:integration
+  artifacts:
+    when: always
+    reports:
+      junit: src/integration-test-results.xml
+  only:
+    - branches
+    - merge_requests
+
+test:e2e:
+  stage: test
+  image: mcr.microsoft.com/playwright:focal
+  needs: ["build:docker"]
+  services:
+    - name: $DOCKER_IMAGE_TAG
+      alias: app
+  variables:
+    APP_URL: "http://app:3000"
+  script:
+    - cd tests/e2e
+    - npm ci
+    - npx playwright test
+  artifacts:
+    when: always
+    paths:
+      - tests/e2e/test-results/
+      - tests/e2e/playwright-report/
+    expire_in: 1 week
+  only:
+    - main
+    - develop
+
+# ============ SECURITY STAGE ============
+security:sast:
+  stage: security
+  extends: .sast
+  variables:
+    SAST_EXCLUDED_PATHS: "node_modules,vendor,tests"
+
+security:container_scanning:
+  stage: security
+  needs: ["build:docker"]
+  variables:
+    CS_IMAGE: $DOCKER_IMAGE_TAG
+    CS_SEVERITY_THRESHOLD: medium
+
+security:dependency_scanning:
+  stage: security
+  extends: .dependency_scanning
+
+security:secret_detection:
+  stage: security
+  extends: .secret_detection
+
+security:license_scanning:
+  stage: security
+  image: 
+    name: licensefinder/license_finder:latest
+    entrypoint: [""]
+  script:
+    - license_finder report --decisions-file=.license_finder.yml
+  artifacts:
+    reports:
+      license_scanning: gl-license-scanning-report.json
+  allow_failure: true
+
+# ============ PACKAGE STAGE ============
+package:helm:
+  stage: package
+  image: alpine/helm:latest
+  needs: ["build:docker"]
+  script:
+    - helm package ./charts/app --version=$CI_COMMIT_SHORT_SHA
+    - helm push app-$CI_COMMIT_SHORT_SHA.tgz oci://$CI_REGISTRY/helm
+  artifacts:
+    paths:
+      - "*.tgz"
+  only:
+    - main
+    - develop
+    - tags
+
+package:documentation:
+  stage: package
+  image: node:18-alpine
+  script:
+    - npm install -g @redocly/cli
+    - redocly build-docs api/openapi.yaml -o public/
+  artifacts:
+    paths:
+      - public/
+  only:
+    - main
+
+# ============ DEPLOY STAGE ============
+.deploy_template:
+  image: bitnami/kubectl:latest
+  before_script:
+    - kubectl config set-cluster k8s --server="$KUBE_URL" --insecure-skip-tls-verify=true
+    - kubectl config set-credentials gitlab --token="$KUBE_TOKEN"
+    - kubectl config set-context default --cluster=k8s --user=gitlab --namespace="$KUBE_NAMESPACE"
+    - kubectl config use-context default
+
+deploy:review:
+  extends: .deploy_template
+  stage: deploy
+  needs: ["build:docker", "test:unit", "test:integration"]
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    url: https://$CI_ENVIRONMENT_SLUG.review.example.com
+    on_stop: stop:review
+    auto_stop_in: 2 days
+  variables:
+    KUBE_NAMESPACE: review-apps
+  script:
+    - |
+      cat <<EOF | kubectl apply -f -
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: $CI_ENVIRONMENT_SLUG
+        namespace: $KUBE_NAMESPACE
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: $CI_ENVIRONMENT_SLUG
+        template:
+          metadata:
+            labels:
+              app: $CI_ENVIRONMENT_SLUG
+          spec:
+            containers:
+            - name: app
+              image: $DOCKER_IMAGE_TAG
+              ports:
+              - containerPort: 3000
+              env:
+              - name: ENVIRONMENT
+                value: review
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: $CI_ENVIRONMENT_SLUG
+        namespace: $KUBE_NAMESPACE
+      spec:
+        selector:
+          app: $CI_ENVIRONMENT_SLUG
+        ports:
+        - port: 80
+          targetPort: 3000
+      ---
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: $CI_ENVIRONMENT_SLUG
+        namespace: $KUBE_NAMESPACE
+      spec:
+        rules:
+        - host: $CI_ENVIRONMENT_SLUG.review.example.com
+          http:
+            paths:
+            - path: /
+              pathType: Prefix
+              backend:
+                service:
+                  name: $CI_ENVIRONMENT_SLUG
+                  port:
+                    number: 80
+      EOF
+  only:
+    - merge_requests
+
+stop:review:
+  extends: .deploy_template
+  stage: cleanup
+  environment:
+    name: review/$CI_COMMIT_REF_SLUG
+    action: stop
+  variables:
+    KUBE_NAMESPACE: review-apps
+  script:
+    - kubectl delete deployment,service,ingress $CI_ENVIRONMENT_SLUG -n $KUBE_NAMESPACE
+  when: manual
+  only:
+    - merge_requests
+
+deploy:staging:
+  extends: .deploy_template
+  stage: deploy
+  needs: ["build:docker", "security:container_scanning", "test:e2e"]
+  environment:
+    name: staging
+    url: https://staging.example.com
+    deployment_tier: staging
+  variables:
+    KUBE_NAMESPACE: staging
+  script:
+    - helm upgrade --install app-staging ./charts/app 
+        --set image.tag=$CI_COMMIT_SHORT_SHA
+        --set environment=staging
+        --namespace $KUBE_NAMESPACE
+        --wait
+  only:
+    - develop
+
+deploy:production:
+  extends: .deploy_template
+  stage: deploy
+  needs: ["deploy:staging"]
+  environment:
+    name: production
+    url: https://example.com
+    deployment_tier: production
+  variables:
+    KUBE_NAMESPACE: production
+  script:
+    - |
+      # Blue-Green Deployment
+      CURRENT_VERSION=$(kubectl get deployment app-production -n $KUBE_NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d: -f2)
+      
+      # Deploy to blue environment
+      helm upgrade --install app-blue ./charts/app \
+        --set image.tag=$CI_COMMIT_SHORT_SHA \
+        --set environment=production \
+        --namespace $KUBE_NAMESPACE \
+        --wait
+      
+      # Run smoke tests
+      ./scripts/smoke-test.sh blue
+      
+      # Switch traffic
+      kubectl patch service app-production \
+        -n $KUBE_NAMESPACE \
+        -p '{"spec":{"selector":{"version":"blue"}}}'
+      
+      # Keep green as backup
+      kubectl annotate deployment app-green \
+        -n $KUBE_NAMESPACE \
+        backup-version=$CURRENT_VERSION \
+        --overwrite
+  when: manual
+  only:
+    - main
+
+# ============ MONITOR STAGE ============
+monitor:performance:
+  stage: monitor
+  image: grafana/k6:latest
+  needs: ["deploy:staging"]
+  script:
+    - k6 run tests/performance/load-test.js --out json=performance-results.json
+  artifacts:
+    paths:
+      - performance-results.json
+    reports:
+      performance: performance-results.json
+  only:
+    - develop
+    - main
+
+monitor:synthetic:
+  stage: monitor
+  image: checkly/cli:latest
+  needs: ["deploy:production"]
+  script:
+    - checkly test --record
+  only:
+    - main
+
+# ============ PAGES (Documentation) ============
+pages:
+  stage: deploy
+  needs: ["package:documentation"]
+  script:
+    - echo "Deploying documentation to GitLab Pages"
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+
+# ============ CLEANUP STAGE ============
+cleanup:old_images:
+  stage: cleanup
+  image: 
+    name: gcr.io/go-containerregistry/crane:latest
+    entrypoint: [""]
+  script:
+    - |
+      # Keep only last 10 images
+      crane ls $CI_REGISTRY_IMAGE | tail -n +11 | while read tag; do
+        crane delete $CI_REGISTRY_IMAGE:$tag
+      done
+  only:
+    - schedules
+  when: manual
+
+cleanup:old_artifacts:
+  stage: cleanup
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl jq
+    - |
+      # Delete artifacts older than 30 days
+      curl --header "PRIVATE-TOKEN: $CI_JOB_TOKEN" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts?per_page=100" | \
+        jq -r '.[] | select(.created_at | fromdateiso8601 < (now - 2592000)) | .id' | \
+        while read job_id; do
+          curl --request DELETE --header "PRIVATE-TOKEN: $CI_JOB_TOKEN" \
+            "$CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/$job_id/artifacts"
+        done
+  only:
+    - schedules
+
+# ============ NOTIFICATIONS ============
+.notify:
+  image: curlimages/curl:latest
+  variables:
+    SLACK_WEBHOOK: $SLACK_WEBHOOK_URL
+
+notify:success:
+  extends: .notify
+  stage: .post
+  script:
+    - |
+      curl -X POST $SLACK_WEBHOOK \
+        -H 'Content-Type: application/json' \
+        -d "{
+          \"text\": \"✅ Pipeline Success\",
+          \"attachments\": [{
+            \"color\": \"good\",
+            \"fields\": [
+              {\"title\": \"Project\", \"value\": \"$CI_PROJECT_NAME\", \"short\": true},
+              {\"title\": \"Branch\", \"value\": \"$CI_COMMIT_BRANCH\", \"short\": true},
+              {\"title\": \"Commit\", \"value\": \"$CI_COMMIT_SHORT_SHA\", \"short\": true},
+              {\"title\": \"Author\", \"value\": \"$GITLAB_USER_NAME\", \"short\": true}
+            ]
+          }]
+        }"
+  when: on_success
+  only:
+    - main
+    - develop
+
+notify:failure:
+  extends: .notify
+  stage: .post
+  script:
+    - |
+      curl -X POST $SLACK_WEBHOOK \
+        -H 'Content-Type: application/json' \
+        -d "{
+          \"text\": \"❌ Pipeline Failed\",
+          \"attachments\": [{
+            \"color\": \"danger\",
+            \"fields\": [
+              {\"title\": \"Project\", \"value\": \"$CI_PROJECT_NAME\", \"short\": true},
+              {\"title\": \"Branch\", \"value\": \"$CI_COMMIT_BRANCH\", \"short\": true},
+              {\"title\": \"Failed Job\", \"value\": \"$CI_JOB_NAME\", \"short\": true},
+              {\"title\": \"Pipeline URL\", \"value\": \"$CI_PIPELINE_URL\"}
+            ]
+          }]
+        }"
+  when: on_failure
+  only:
+    - main
+    - develop

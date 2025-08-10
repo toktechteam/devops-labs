@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-actions-demo
+  labels:
+    app: github-actions-demo
+    version: v1
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: github-actions-demo
+  template:
+    metadata:
+      labels:
+        app: github-actions-demo
+        version: v1
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/${GITHUB_REPOSITORY}/github-actions-demo:${GITHUB_SHA}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+              name: http
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: PORT
+              value: "3000"
+            - name: GITHUB_SHA
+              value: "${GITHUB_SHA}"
+            - name: GITHUB_REF
+              value: "${GITHUB_REF}"
+            - name: GITHUB_RUN_NUMBER
+              value: "${GITHUB_RUN_NUMBER}"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3

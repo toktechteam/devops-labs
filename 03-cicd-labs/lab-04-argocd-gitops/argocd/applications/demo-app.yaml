@@ -1,0 +1,262 @@
+# ArgoCD Application Manifest
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/name: demo-app
+    app.kubernetes.io/part-of: demo-platform
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  # Project this application belongs to
+  project: default
+  
+  # Source of Kubernetes manifests
+  source:
+    repoURL: https://github.com/your-username/gitops-demo
+    targetRevision: HEAD
+    path: applications/demo-app/overlays/development
+    
+    # Kustomize specific config
+    kustomize:
+      namePrefix: dev-
+      nameSuffix: -v1
+      commonLabels:
+        environment: development
+        managed-by: argocd
+      images:
+        - name: demo-app
+          newTag: latest
+    
+    # Helm specific config (alternative to Kustomize)
+    # helm:
+    #   releaseName: demo-app
+    #   valueFiles:
+    #     - values-dev.yaml
+    #   parameters:
+    #     - name: image.tag
+    #       value: latest
+    #   values: |
+    #     replicaCount: 2
+    #     service:
+    #       type: ClusterIP
+  
+  # Destination cluster and namespace
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo-dev
+  
+  # Sync policy
+  syncPolicy:
+    automated:
+      prune: true        # Delete resources not in Git
+      selfHeal: true     # Correct drift automatically
+      allowEmpty: false  # Don't sync if path is empty
+    
+    syncOptions:
+      - CreateNamespace=true           # Create namespace if doesn't exist
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true                 # Prune resources after others are healthy
+      - RespectIgnoreDifferences=true
+      - ApplyOutOfSyncOnly=true
+    
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  
+  # Health assessment
+  health:
+    progressDeadlineSeconds: 600
+  
+  # Ignore differences
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+    - group: ""
+      kind: Service
+      jsonPointers:
+        - /spec/clusterIP
+  
+  # Notification subscriptions
+  info:
+    - name: url
+      value: https://example.com
+    - name: chat
+      value: slack:argocd-notifications
+
+---
+# AppProject for grouping applications
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: demo-project
+  namespace: argocd
+spec:
+  description: Demo project for GitOps lab
+  
+  # Source repositories
+  sourceRepos:
+    - https://github.com/your-username/gitops-demo
+    - https://github.com/your-username/helm-charts
+  
+  # Destinations where apps can be deployed
+  destinations:
+    - namespace: 'demo-*'
+      server: https://kubernetes.default.svc
+    - namespace: 'production'
+      server: https://kubernetes.default.svc
+      name: in-cluster
+  
+  # Cluster resource whitelist
+  clusterResourceWhitelist:
+    - group: ''
+      kind: Namespace
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+  
+  # Namespace resource whitelist
+  namespaceResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  
+  # Namespace resource blacklist
+  namespaceResourceBlacklist:
+    - group: ''
+      kind: ResourceQuota
+    - group: ''
+      kind: LimitRange
+    - group: ''
+      kind: NetworkPolicy
+  
+  # Roles
+  roles:
+    - name: developers
+      policies:
+        - p, proj:demo-project:developers, applications, get, demo-project/*, allow
+        - p, proj:demo-project:developers, applications, sync, demo-project/*, allow
+      groups:
+        - dev-team
+    
+    - name: admins
+      policies:
+        - p, proj:demo-project:admins, applications, *, demo-project/*, allow
+        - p, proj:demo-project:admins, repositories, *, *, allow
+      groups:
+        - admin-team
+
+---
+# ApplicationSet for managing multiple apps
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: demo-apps
+  namespace: argocd
+spec:
+  generators:
+    # List generator
+    - list:
+        elements:
+          - cluster: development
+            url: https://kubernetes.default.svc
+            namespace: demo-dev
+            branch: develop
+          - cluster: staging
+            url: https://kubernetes.default.svc
+            namespace: demo-staging
+            branch: staging
+          - cluster: production
+            url: https://kubernetes.default.svc
+            namespace: demo-prod
+            branch: main
+    
+    # Git generator (discovers apps from Git)
+    - git:
+        repoURL: https://github.com/your-username/gitops-demo
+        revision: HEAD
+        directories:
+          - path: applications/*
+        template:
+          metadata: {}
+          spec:
+            project: "default"
+            source:
+              repoURL: https://github.com/your-username/gitops-demo
+              targetRevision: HEAD
+              path: '{{path}}'
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: '{{path.basename}}'
+    
+    # Cluster generator (multi-cluster)
+    - clusters:
+        selector:
+          matchLabels:
+            environment: production
+        template:
+          metadata: {}
+          spec:
+            project: "production"
+            source:
+              repoURL: https://github.com/your-username/gitops-demo
+              targetRevision: main
+              path: applications/{{name}}
+            destination:
+              server: '{{server}}'
+              namespace: production
+  
+  template:
+    metadata:
+      name: '{{cluster}}-demo-app'
+      labels:
+        environment: '{{cluster}}'
+    spec:
+      project: demo-project
+      source:
+        repoURL: https://github.com/your-username/gitops-demo
+        targetRevision: '{{branch}}'
+        path: applications/demo-app/overlays/{{cluster}}
+      destination:
+        server: '{{url}}'
+        namespace: '{{namespace}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+
+---
+# App of Apps pattern
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-username/gitops-demo
+    targetRevision: HEAD
+    path: argocd/applications
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

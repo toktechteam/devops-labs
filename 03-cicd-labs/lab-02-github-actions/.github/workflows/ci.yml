@@ -1,0 +1,377 @@
+name: CI Pipeline
+
+# Triggers
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Manual trigger
+
+# Environment variables
+env:
+  NODE_VERSION: '18'
+  DOCKER_REGISTRY: docker.io
+
+jobs:
+  # Job 1: Code Quality
+  code-quality:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Full history for better analysis
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: src/package-lock.json
+      
+      - name: Install dependencies
+        run: |
+          cd src
+          npm ci
+      
+      - name: Run ESLint
+        run: |
+          cd src
+          npm run lint || true
+        continue-on-error: true
+      
+      - name: Run Prettier check
+        run: |
+          cd src
+          npx prettier --check "**/*.{js,json,md}" || true
+      
+      - name: Check for secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+
+  # Job 2: Testing
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    strategy:
+      matrix:
+        node-version: [16, 18, 20]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: src/package-lock.json
+      
+      - name: Install dependencies
+        run: |
+          cd src
+          npm ci
+      
+      - name: Run unit tests
+        run: |
+          cd src
+          npm test
+      
+      - name: Run integration tests
+        run: |
+          cd src
+          npm run test:integration || echo "No integration tests"
+      
+      - name: Generate coverage report
+        run: |
+          cd src
+          npm run test:coverage || npm test
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./src/coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+  # Job 3: Security Scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+      
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'github-actions-demo'
+          path: './src'
+          format: 'HTML'
+
+  # Job 4: Build Docker Image
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: |
+            ${{ env.DOCKER_REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/github-actions-demo
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ github.run_number }}
+      
+      - name: Run Trivy on Docker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+  # Job 5: Integration Tests
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/testdb
+          REDIS_URL: redis://localhost:6379
+        run: |
+          cd src
+          npm ci
+          npm run test:integration || echo "Integration tests completed"
+      
+      - name: Test Docker container
+        run: |
+          docker run -d --name test-app -p 3000:3000 \
+            -e NODE_ENV=test \
+            ${{ needs.build.outputs.image-tag }}
+          
+          sleep 10
+          
+          # Test endpoints
+          curl -f http://localhost:3000/health || exit 1
+          curl -f http://localhost:3000/ready || exit 1
+          curl -f http://localhost:3000/ || exit 1
+          
+          docker logs test-app
+          docker stop test-app
+
+  # Job 6: Performance Tests
+  performance-test:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Run container for testing
+        run: |
+          docker run -d --name perf-app -p 3000:3000 \
+            ${{ needs.build.outputs.image-tag }}
+          sleep 10
+      
+      - name: Run k6 performance tests
+        uses: grafana/k6-action@v0.3.0
+        with:
+          filename: tests/performance/load-test.js
+          flags: --out json=results.json
+      
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: results.json
+
+  # Job 7: Create Release
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build, integration-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Generate changelog
+        id: changelog
+        run: |
+          echo "# Release Notes" > CHANGELOG.md
+          echo "## What's Changed" >> CHANGELOG.md
+          git log --pretty=format:"- %s (%h)" HEAD~10..HEAD >> CHANGELOG.md
+      
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+
+  # Job 8: Notify
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [build, test, security]
+    if: always()
+    
+    steps:
+      - name: Slack Notification
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          text: |
+            CI Pipeline ${{ job.status }}
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref }}
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        continue-on-error: true
+      
+      - name: Create issue on failure
+        if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `CI Pipeline Failed - Run #${context.runNumber}`,
+              body: `The CI pipeline failed on ${context.sha}. 
+                     \nWorkflow: ${context.workflow}
+                     \nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}
+                     \nAuthor: @${context.actor}`,
+              labels: ['bug', 'ci-failure']
+            })
+
+# Summary of workflow
+# 1. Code quality checks (linting, formatting, secrets)
+# 2. Multi-version testing (Node 16, 18, 20)
+# 3. Security scanning (Trivy, Snyk, OWASP)
+# 4. Docker build and push (multi-platform)
+# 5. Integration testing with external services
+# 6. Performance testing (conditional)
+# 7. Automatic release creation
+# 8. Notifications (Slack, GitHub issues)

@@ -1,0 +1,43 @@
+# Ultra-minimal Python image using distroless
+# Stage 1: Build environment
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Copy and install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --target=/app/deps -r requirements.txt
+
+# Copy application
+COPY app.py /app/
+
+# Stage 2: Distroless runtime
+FROM gcr.io/distroless/python3-debian12
+
+# Copy Python dependencies
+COPY --from=builder /app/deps /app/deps
+
+# Copy application
+COPY --from=builder /app/app.py /app/
+
+# Set Python path
+ENV PYTHONPATH=/app/deps \
+    APP_VERSION=1.0.0-minimal
+
+WORKDIR /app
+
+EXPOSE 5000
+
+# Note: Distroless doesn't have shell, so no HEALTHCHECK with curl
+# Use external health checking instead
+
+ENTRYPOINT ["python", "app.py"]
+
+# This creates an image of approximately 50-60MB
+# Advantages:
+# - Minimal attack surface (no shell, package managers, etc.)
+# - Small size
+# - Secure by default
+# Disadvantages:
+# - No shell for debugging
+# - Limited troubleshooting capabilities

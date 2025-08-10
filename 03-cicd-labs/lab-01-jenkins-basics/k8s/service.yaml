@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins-demo-app
+  namespace: default
+  labels:
+    app: jenkins-demo
+spec:
+  type: LoadBalancer
+  selector:
+    app: jenkins-demo
+  ports:
+    - port: 80
+      targetPort: 5000
+      protocol: TCP
+      name: http
+  sessionAffinity: ClientIP

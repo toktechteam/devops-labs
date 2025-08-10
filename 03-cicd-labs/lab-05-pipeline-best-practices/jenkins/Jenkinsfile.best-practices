@@ -1,0 +1,366 @@
+// Best Practices Jenkinsfile with all advanced features
+@Library('shared-pipeline-library') _
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: maven
+    image: maven:3.8-openjdk-11
+    command: ['cat']
+    tty: true
+  - name: docker
+    image: docker:20.10
+    command: ['cat']
+    tty: true
+    volumeMounts:
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
+  - name: kubectl
+    image: bitnami/kubectl:latest
+    command: ['cat']
+    tty: true
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+"""
+        }
+    }
+
+    environment {
+        // Global environment variables
+        APP_NAME = 'best-practices-app'
+        DOCKER_REGISTRY = credentials('docker-registry')
+        SONAR_HOST = credentials('sonar-host')
+        SLACK_WEBHOOK = credentials('slack-webhook')
+
+        // Dynamic variables
+        VERSION = "${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
+        GIT_COMMIT_SHORT = "${env.GIT_COMMIT?.take(7)}"
+    }
+
+    options {
+        timestamps()
+        timeout(time: 1, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+        disableConcurrentBuilds()
+        skipDefaultCheckout()
+        ansiColor('xterm')
+    }
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'production'], description: 'Deployment environment')
+        booleanParam(name: 'RUN_SECURITY_SCAN', defaultValue: true, description: 'Run security scanning')
+        booleanParam(name: 'DEPLOY', defaultValue: false, description: 'Deploy after build')
+        string(name: 'CUSTOM_VERSION', defaultValue: '', description: 'Override version number')
+    }
+
+    triggers {
+        pollSCM('H/5 * * * *')
+        cron('@daily')
+        upstream(upstreamProjects: 'upstream-job', threshold: hudson.model.Result.SUCCESS)
+    }
+
+    stages {
+        stage('Initialization') {
+            steps {
+                script {
+                    // Clean workspace
+                    cleanWs()
+
+                    // Checkout with specific options
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "${env.BRANCH_NAME}"]],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [
+                            [$class: 'CleanBeforeCheckout'],
+                            [$class: 'CloneOption', depth: 1, noTags: false, shallow: true]
+                        ],
+                        userRemoteConfigs: [[
+                            credentialsId: 'github-credentials',
+                            url: 'https://github.com/org/repo.git'
+                        ]]
+                    ])
+
+                    // Set build description
+                    currentBuild.displayName = "#${BUILD_NUMBER} - ${params.ENVIRONMENT}"
+                    currentBuild.description = "Version: ${VERSION}, Commit: ${GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+
+        stage('Quality Gates') {
+            parallel {
+                stage('Code Analysis') {
+                    steps {
+                        container('maven') {
+                            sh '''
+                                mvn clean compile
+                                mvn sonar:sonar \
+                                    -Dsonar.host.url=${SONAR_HOST} \
+                                    -Dsonar.projectKey=${APP_NAME} \
+                                    -Dsonar.projectVersion=${VERSION}
+                            '''
+                        }
+                    }
+                }
+
+                stage('Security Scanning') {
+                    when {
+                        expression { params.RUN_SECURITY_SCAN }
+                    }
+                    steps {
+                        script {
+                            // SAST
+                            sh 'docker run --rm -v $(pwd):/src aquasec/trivy fs --security-checks vuln,config /src'
+
+                            // Dependency check
+                            dependencyCheck additionalArguments: '--scan ./', odcInstallation: 'dependency-check'
+
+                            // Secret scanning
+                            sh 'docker run --rm -v $(pwd):/src trufflesecurity/trufflehog filesystem /src'
+                        }
+                    }
+                }
+
+                stage('License Compliance') {
+                    steps {
+                        sh 'docker run --rm -v $(pwd):/src licensefinder/license_finder'
+                    }
+                }
+            }
+        }
+
+        stage('Build & Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        container('maven') {
+                            sh 'mvn test'
+                            junit 'target/surefire-reports/**/*.xml'
+                        }
+                    }
+                }
+
+                stage('Integration Tests') {
+                    steps {
+                        container('maven') {
+                            sh 'mvn verify -Pintegration-tests'
+                            junit 'target/failsafe-reports/**/*.xml'
+                        }
+                    }
+                }
+
+                stage('Performance Tests') {
+                    steps {
+                        script {
+                            sh '''
+                                docker run --rm \
+                                    -v $(pwd)/tests/performance:/scripts \
+                                    grafana/k6 run /scripts/load-test.js
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Artifacts') {
+            steps {
+                container('docker') {
+                    script {
+                        // Build Docker image with buildkit
+                        sh """
+                            DOCKER_BUILDKIT=1 docker build \
+                                --build-arg VERSION=${VERSION} \
+                                --build-arg GIT_COMMIT=${GIT_COMMIT} \
+                                --cache-from ${DOCKER_REGISTRY}/${APP_NAME}:latest \
+                                -t ${DOCKER_REGISTRY}/${APP_NAME}:${VERSION} \
+                                -t ${DOCKER_REGISTRY}/${APP_NAME}:latest \
+                                .
+                        """
+
+                        // Scan image for vulnerabilities
+                        sh "docker run --rm aquasec/trivy image ${DOCKER_REGISTRY}/${APP_NAME}:${VERSION}"
+
+                        // Push to registry
+                        docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-credentials') {
+                            sh "docker push ${DOCKER_REGISTRY}/${APP_NAME}:${VERSION}"
+                            sh "docker push ${DOCKER_REGISTRY}/${APP_NAME}:latest"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                expression { params.DEPLOY }
+            }
+            stages {
+                stage('Deploy to Dev') {
+                    when {
+                        expression { params.ENVIRONMENT == 'dev' }
+                    }
+                    steps {
+                        deployToEnvironment('dev', false)
+                    }
+                }
+
+                stage('Deploy to Staging') {
+                    when {
+                        expression { params.ENVIRONMENT == 'staging' }
+                    }
+                    steps {
+                        deployToEnvironment('staging', true)
+                    }
+                }
+
+                stage('Deploy to Production') {
+                    when {
+                        expression { params.ENVIRONMENT == 'production' }
+                    }
+                    input {
+                        message "Deploy to production?"
+                        ok "Yes, deploy to production"
+                        parameters {
+                            choice(name: 'STRATEGY', choices: ['blue-green', 'canary', 'rolling'], description: 'Deployment strategy')
+                        }
+                    }
+                    steps {
+                        script {
+                            deployToProduction(STRATEGY)
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Post-Deployment') {
+            parallel {
+                stage('Smoke Tests') {
+                    steps {
+                        script {
+                            sh """
+                                ./scripts/smoke-tests.sh ${params.ENVIRONMENT}
+                            """
+                        }
+                    }
+                }
+
+                stage('Health Checks') {
+                    steps {
+                        script {
+                            retry(3) {
+                                sh """
+                                    curl -f https://${params.ENVIRONMENT}.example.com/health
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // Archive artifacts
+            archiveArtifacts artifacts: '**/target/*.jar', allowEmptyArchive: true
+
+            // Publish test results
+            junit '**/target/**/TEST-*.xml'
+
+            // Publish coverage
+            publishHTML([
+                reportDir: 'target/site/jacoco',
+                reportFiles: 'index.html',
+                reportName: 'Code Coverage'
+            ])
+
+            // Clean workspace
+            cleanWs()
+        }
+
+        success {
+            script {
+                sendSlackNotification('SUCCESS', "Build #${BUILD_NUMBER} succeeded!")
+                updateGitHubStatus('success', 'Build succeeded')
+            }
+        }
+
+        failure {
+            script {
+                sendSlackNotification('FAILURE', "Build #${BUILD_NUMBER} failed!")
+                updateGitHubStatus('failure', 'Build failed')
+                createJiraIssue("Build failure: ${BUILD_URL}")
+            }
+        }
+
+        unstable {
+            script {
+                sendSlackNotification('UNSTABLE', "Build #${BUILD_NUMBER} is unstable")
+                updateGitHubStatus('failure', 'Build unstable')
+            }
+        }
+    }
+}
+
+// Shared functions
+def deployToEnvironment(environment, runTests) {
+    container('kubectl') {
+        sh """
+            kubectl set image deployment/${APP_NAME} \
+                ${APP_NAME}=${DOCKER_REGISTRY}/${APP_NAME}:${VERSION} \
+                --namespace=${environment}
+
+            kubectl rollout status deployment/${APP_NAME} \
+                --namespace=${environment} \
+                --timeout=5m
+        """
+
+        if (runTests) {
+            sh "./scripts/test-deployment.sh ${environment}"
+        }
+    }
+}
+
+def deployToProduction(strategy) {
+    switch(strategy) {
+        case 'blue-green':
+            blueGreenDeployment()
+            break
+        case 'canary':
+            canaryDeployment()
+            break
+        case 'rolling':
+            rollingDeployment()
+            break
+    }
+}
+
+def sendSlackNotification(status, message) {
+    sh """
+        curl -X POST ${SLACK_WEBHOOK} \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "${status}: ${message}"}'
+    """
+}
+
+def updateGitHubStatus(state, description) {
+    githubNotify(
+        credentialsId: 'github-token',
+        account: 'org',
+        repo: 'repo',
+        sha: "${GIT_COMMIT}",
+        status: state,
+        description: description,
+        targetUrl: "${BUILD_URL}"
+    )
+}

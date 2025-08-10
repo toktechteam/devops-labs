@@ -1,0 +1,59 @@
+# Multi-stage Dockerfile for minimal image size
+# Stage 1: Build environment
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install dependencies to a specific location
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# Stage 2: Runtime environment
+FROM python:3.11-slim
+
+# Metadata
+LABEL maintainer="devops@example.com" \
+      version="2.0.0" \
+      description="Multi-stage Flask application"
+
+# Build arguments
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VERSION=2.0.0
+
+# Environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    APP_VERSION=${VERSION} \
+    BUILD_DATE=${BUILD_DATE} \
+    VCS_REF=${VCS_REF} \
+    PATH=/home/appuser/.local/bin:$PATH
+
+# Install minimal runtime dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r appuser && \
+    useradd -r -g appuser -d /home/appuser -s /sbin/nologin -c "App user" appuser
+
+WORKDIR /app
+
+# Copy Python packages from builder
+COPY --from=builder --chown=appuser:appuser /root/.local /home/appuser/.local
+
+# Copy application
+COPY --chown=appuser:appuser app.py .
+
+# Switch to non-root user
+USER appuser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+EXPOSE 5000
+
+CMD ["python", "app.py"]

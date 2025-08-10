@@ -1,0 +1,56 @@
+# Optimized Dockerfile with best practices
+FROM python:3.11-slim
+
+# Metadata
+LABEL maintainer="devops@example.com" \
+      version="1.0.0" \
+      description="Optimized Flask application"
+
+# Build arguments
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VERSION=1.0.0
+
+# Environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    APP_VERSION=${VERSION} \
+    BUILD_DATE=${BUILD_DATE} \
+    VCS_REF=${VCS_REF}
+
+# Create non-root user early
+RUN groupadd -r appuser && \
+    useradd -r -g appuser -d /app -s /sbin/nologin -c "App user" appuser
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies if needed
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first (better layer caching)
+COPY --chown=appuser:appuser requirements.txt .
+
+# Install Python dependencies as root
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code with correct ownership
+COPY --chown=appuser:appuser app.py .
+
+# Switch to non-root user
+USER appuser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# Expose port (documentation only)
+EXPOSE 5000
+
+# Use exec form for proper signal handling
+CMD ["python", "app.py"]
